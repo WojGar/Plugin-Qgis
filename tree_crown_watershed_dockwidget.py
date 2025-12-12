@@ -12,6 +12,8 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
 )
 from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtGui import QColor, QFont
+
 
 from qgis.core import (
     QgsProject,
@@ -20,11 +22,18 @@ from qgis.core import (
     QgsGeometry,
     QgsPointXY,
     QgsField,
+    QgsSymbol,
+    QgsCategorizedSymbolRenderer,
+    QgsRendererCategory,
+    QgsTextFormat,
+    QgsPalLayerSettings,
+    QgsVectorLayerSimpleLabeling
 )
 
 from pathlib import Path
 import traceback
-import os
+import numpy as np
+import random
 
 from . import watershed_backend
 
@@ -34,6 +43,8 @@ class TreeCrownWatershedDockWidget(QDockWidget):
         super().__init__(parent)
         self.iface = iface
         self.setWindowTitle("Tree Crown Watershed")
+
+        self.crowns_layer = None  # warstwa z koronami (punkty z tree_id)
 
         root = QWidget(self)
         self.setWidget(root)
@@ -83,6 +94,10 @@ class TreeCrownWatershedDockWidget(QDockWidget):
         self.chkShowLM.setChecked(True)
         main_layout.addWidget(self.chkShowLM)
 
+        self.chkCreateCrowns = QCheckBox("Dodaj warstwę z koronami (punkty z tree_id)")
+        self.chkCreateCrowns.setChecked(True)
+        main_layout.addWidget(self.chkCreateCrowns)
+
         main_layout.addStretch()
 
         # --- przycisk ---
@@ -126,21 +141,30 @@ class TreeCrownWatershedDockWidget(QDockWidget):
             watershed_backend.MIN_DIST = self.spinMinDist.value()
             watershed_backend.GAUSS_SIGMA = self.spinSigma.value()
 
-            out_path = src.with_name(src.stem + "_trees_3d.las")
+            result = watershed_backend.process_wycinek(src)
 
-            result = watershed_backend.process_wycinek(src, out_path)
+            treetops = result.get("treetops_xy", np.empty((0, 2)))
+            crown_xy = result.get("crown_points_xy", np.empty((0, 2)))
+            crown_ids = result.get("crown_tree_ids", np.array([], dtype=np.uint32))
 
-            treetops = result.get("treetops_xy", [])
             if self.chkShowLM.isChecked() and len(treetops) > 0:
                 self.add_lm_layer(treetops, layer.crs().authid())
+
+            if (
+                self.chkCreateCrowns.isChecked()
+                and len(crown_xy) > 0
+                and len(crown_ids) == len(crown_xy)
+            ):
+                self.crowns_layer = self.add_crowns_layer(
+                    crown_xy, crown_ids, layer.crs().authid()
+                )
 
             QMessageBox.information(
                 self,
                 "Zakończono",
                 f"Segmentacja zakończona.\n"
                 f"Punktów wejściowych: {result['n_points']}\n"
-                f"Liczba drzew (segmentów): {result['n_trees']}\n"
-                f"Wynik zapisano do:\n{out_path}",
+                f"Liczba drzew (segmentów): {result['n_trees']}\n",
             )
 
         except Exception as e:
@@ -160,10 +184,85 @@ class TreeCrownWatershedDockWidget(QDockWidget):
         feats = []
         for i, (x, y) in enumerate(coords, start=1):
             f = QgsFeature()
+            f.setFields(vlayer.fields())
             f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(x), float(y))))
-            f.setAttribute("id", i)
+            f.setAttribute("id", int(i))
             feats.append(f)
 
         pr.addFeatures(feats)
         vlayer.updateExtents()
         QgsProject.instance().addMapLayer(vlayer)
+
+        # czerwone punkty
+        sym = QgsSymbol.defaultSymbol(vlayer.geometryType())
+        sym.setColor(QColor(255, 0, 0))
+        vlayer.renderer().setSymbol(sym)
+
+        text_format = QgsTextFormat()
+        text_format.setFont(QFont("Arial", 11))
+        text_format.setSize(11)
+        text_format.setColor(QColor(255, 255, 255))
+
+        # Czarna obwódka wokół liter
+        buffer = text_format.buffer()
+        buffer.setEnabled(True)
+        buffer.setSize(1.2)  # grubość obwódki
+        buffer.setColor(QColor(0, 0, 0))
+        text_format.setBuffer(buffer)
+
+        pal = QgsPalLayerSettings()
+        pal.fieldName = "id"
+        pal.enabled = True
+        pal.setFormat(text_format)
+
+        labeling = QgsVectorLayerSimpleLabeling(pal)
+        vlayer.setLabeling(labeling)
+        vlayer.setLabelsEnabled(True)
+        vlayer.triggerRepaint()
+
+        return vlayer
+
+    def add_crowns_layer(self, coords, tree_ids, crs_authid: str):
+        if coords is None or len(coords) == 0:
+            return None
+        if tree_ids is None or len(tree_ids) == 0:
+            return None
+
+        vlayer = QgsVectorLayer(f"Point?crs={crs_authid}", "CrownsPoints", "memory")
+        pr = vlayer.dataProvider()
+
+        pr.addAttributes([QgsField("tree_id", QVariant.Int)])
+        vlayer.updateFields()
+
+        feats = []
+        for (x, y), tid in zip(coords, tree_ids):
+            f = QgsFeature()
+            f.setFields(vlayer.fields())
+            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(float(x), float(y))))
+            f.setAttribute("tree_id", int(tid))
+            feats.append(f)
+
+        pr.addFeatures(feats)
+        vlayer.updateExtents()
+        QgsProject.instance().addMapLayer(vlayer)
+
+        unique_ids = sorted(set(int(t) for t in tree_ids if t > 0))
+        categories = []
+
+        for tid in unique_ids:
+            sym = QgsSymbol.defaultSymbol(vlayer.geometryType())
+            sym.setSize(1.5)
+            sym.setColor(
+                QColor(
+                    random.randint(50, 255),
+                    random.randint(50, 255),
+                    random.randint(50, 255),
+                )
+            )
+            cat = QgsRendererCategory(tid, sym, f"Drzewo {tid}")
+            categories.append(cat)
+
+        renderer = QgsCategorizedSymbolRenderer("tree_id", categories)
+        vlayer.setRenderer(renderer)
+        vlayer.triggerRepaint()
+        return vlayer

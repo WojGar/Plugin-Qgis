@@ -114,23 +114,7 @@ def assign_tree_ids(las, labels, xmin, ymin, cell_size):
     print("Punktów z przypisanym ID drzewa:", int((tree_ids > 0).sum()))
     return tree_ids
 
-
-def save_las_with_tree_ids(las, tree_ids, out_las: Path):
-    out = laspy.create(point_format=las.header.point_format, file_version=las.header.version)
-    out.header = las.header
-    out.points = las.points
-
-    out.add_extra_dim(laspy.ExtraBytesParams(name="tree_id", type=np.uint32))
-    out["tree_id"] = tree_ids
-    out.user_data = np.clip(tree_ids, 0, 255).astype(np.uint8)
-
-    out_las.parent.mkdir(parents=True, exist_ok=True)
-    out.write(out_las)
-    print("Zapisano LAS z tree_id:", out_las)
-    return out
-
-
-def process_wycinek(src: Path, out_las: Path) -> dict:
+def process_wycinek(src: Path) -> dict:
     print("\n===================================")
     print(" PRZETWARZAM WYCINEK:", src.name)
     print("===================================\n")
@@ -138,15 +122,21 @@ def process_wycinek(src: Path, out_las: Path) -> dict:
     las = load_las(src)
 
     x, y, z, _ = filter_high_vegetation(las)
+
     if len(x) == 0:
         print("[WARN] Brak punktów klasy 5 – nic nie robię.")
         tree_ids = np.zeros_like(las.x, dtype=np.uint32)
-        las_out = save_las_with_tree_ids(las, tree_ids, out_las)
+        empty_xy = np.empty((0, 2), dtype=float)
+        empty_ids = np.array([], dtype=np.uint32)
+
         return {
-            "las_out": las_out,
+            "las": las,
+            "tree_ids": tree_ids,
             "n_points": len(las.x),
             "n_trees": 0,
-            "treetops_xy": np.empty((0, 2), dtype=float),
+            "treetops_xy": empty_xy,
+            "crown_points_xy": empty_xy,
+            "crown_tree_ids": empty_ids,
         }
 
     chm, xmin, ymin, nx, ny = build_chm(x, y, z, CELL)
@@ -164,27 +154,39 @@ def process_wycinek(src: Path, out_las: Path) -> dict:
     if len(coords) == 0:
         print("[WARN] Brak wykrytych czubków drzew – tree_id będą zerowe.")
         tree_ids = np.zeros_like(las.x, dtype=np.uint32)
-        las_out = save_las_with_tree_ids(las, tree_ids, out_las)
+        empty_xy = np.empty((0, 2), dtype=float)
+        empty_ids = np.array([], dtype=np.uint32)
+
         return {
-            "las_out": las_out,
+            "las": las,
+            "tree_ids": tree_ids,
             "n_points": len(las.x),
             "n_trees": 0,
             "treetops_xy": pred_xy,
+            "crown_points_xy": empty_xy,
+            "crown_tree_ids": empty_ids,
         }
 
     labels = segment_crowns(chm_smooth, coords)
     tree_ids = assign_tree_ids(las, labels, xmin, ymin, CELL)
-    las_out = save_las_with_tree_ids(las, tree_ids, out_las)
 
     n_trees = int(labels.max())
     print(f"[OK] Zakończono. Liczba drzew (segmentów): {n_trees}")
 
+    mask = tree_ids > 0
+    crown_xy = np.column_stack((las.x[mask], las.y[mask]))
+    crown_ids = tree_ids[mask]
+
     return {
-        "las_out": las_out,
+        "las": las,
+        "tree_ids": tree_ids,
         "n_points": len(las.x),
         "n_trees": n_trees,
         "treetops_xy": pred_xy,
+        "crown_points_xy": crown_xy,
+        "crown_tree_ids": crown_ids,
     }
+
 
 
 def _cli():
@@ -194,9 +196,8 @@ def _cli():
         sys.exit(1)
 
     src = Path(sys.argv[1])
-    out_las = Path(sys.argv[2])
 
-    process_wycinek(src, out_las)
+    process_wycinek(src)
 
 
 if __name__ == "__main__":
